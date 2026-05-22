@@ -8,4 +8,4 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY script.py .
 
-ENTRYPOINT [ "python", "-u" "/app/script.py" ]
+ENTRYPOINT [ "python", "-u", "/app/script.py" ]

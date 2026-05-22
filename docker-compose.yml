@@ -10,11 +10,6 @@ services:
       - "--retentionPeriod=30d"
     ports:
       - "127.0.0.1:9428:9428"
-    healthcheck:
-      test: ["CMD", "wget", "-qO-", "http://localhost:9428/health"]
-      interval: 10s
-      timeout: 5s
-      retries: 3
 
   syslog-receiver:
     build: .
@@ -24,9 +19,6 @@ services:
       - "514:514/udp"
     environment:
       - VICTORIA_URL=http://victorialogs:9428
-    depends_on:
-      victorialogs:
-        condition: service_healthy
     cap_drop:
       - ALL
     cap_add:
