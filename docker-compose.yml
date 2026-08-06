@@ -7,9 +7,9 @@ services:
       - victoria-logs-data:/victoria-logs-data
     command:
       - "--storageDataPath=/victoria-logs-data"
-      - "--retentionPeriod=30d"
+      - "--retentionPeriod=28d"
     ports:
-      - "127.0.0.1:9428:9428"
+      - "9428:9428"
 
   syslog-receiver:
     build: .
