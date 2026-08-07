@@ -19,6 +19,8 @@ services:
       - "514:514/udp"
     environment:
       - VICTORIA_URL=http://victorialogs:9428
+    volumes:
+      - ./logs:/logs  # Монтируем локальную папку для сохранения логов
     cap_drop:
       - ALL
     cap_add:

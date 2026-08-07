@@ -1,12 +1,17 @@
 import socket
 import requests
 import os
+from datetime import datetime
+import time
 
 UDP_IP = "0.0.0.0"
 UDP_PORT = 514
 
 # VictoriaLogs URL из переменной окружения
 VICTORIA_URL = os.environ.get("VICTORIA_URL", "http://victorialogs:9428")
+
+# Файл для сохранения всех логов (будет смонтирован наружу)
+LOG_FILE = "/logs/access.log"
 
 DEVICE_NAMES = {
     "10.204.7.7": "CONT 2.3.1",
@@ -49,153 +54,127 @@ DEVICE_NAMES = {
     "10.204.1.45": "1.1 Калитка",
 }
 
-# Префиксы модулей, которые генерируют логи о ключах
-RELEVANT_MODULES = ("ca_module_arm", "net_module_arm")
+HEX_CHARS = set('0123456789abcdefABCDEF')
 
-# Ключевые слова для быстрой фильтрации (все lowercase для ускорения)
-FILTER_KEYWORDS = (
-    "badge_code_ind",
-    "ca_send_code",
-    "access approved",
-    "access_approved",
-    "analyze code",
-    "room_",
-)
+def extract_hex_code(message):
+    """Извлекает 16-значный hex-код из сообщения в любом формате"""
+    # Ищем в кавычках
+    start = message.find("'")
+    while start != -1:
+        end = start + 17
+        if end < len(message) and message[end] == "'":
+            code = message[start+1:end]
+            if len(code) == 16 and all(c in HEX_CHARS for c in code):
+                return code
+        start = message.find("'", start + 1)
+    
+    # Ищем без кавычек
+    i = 0
+    while i < len(message) - 15:
+        if message[i] in HEX_CHARS:
+            code = message[i:i+16]
+            if len(code) == 16 and all(c in HEX_CHARS for c in code):
+                before_ok = (i == 0 or message[i-1] not in HEX_CHARS)
+                after_ok = (i+16 == len(message) or message[i+16] not in HEX_CHARS)
+                if before_ok and after_ok:
+                    return code
+        i += 1
+    return None
 
-def is_relevant_log_fast(message):
-    """
-    Максимально быстрая фильтрация через простые проверки.
-    Никаких регулярных выражений!
-    """
-    # 1. Быстрая проверка модуля
+def is_relevant_log(message):
+    """Проверяет, содержит ли сообщение 16-значный hex-код"""
     if "ca_module_arm" not in message and "net_module_arm" not in message:
         return False
+    return extract_hex_code(message) is not None
 
-    # 2. Переводим в lowercase один раз для проверки ключевых слов
-    msg_lower = message.lower()
-
-    # 3. Проверяем наличие ключевых слов
-    for keyword in FILTER_KEYWORDS:
-        if keyword in msg_lower:
-            return True
-
-    # 4. Проверяем наличие 16-значного hex-кода (без регулярки!)
-    #    Ищем "'xxxxxxxxxxxxxxxx'" - кавычка, 16 hex символов, кавычка
-    #    Это быстрое сканирование строки без компиляции regex
-    if "'" in message:
-        # Ищем позицию кавычки
-        start = message.find("'")
-        while start != -1:
-            # Проверяем, что после кавычки 16 hex символов и закрывающая кавычка
-            end = start + 17  # 1 кавычка + 16 символов
-            if end < len(message) and message[end] == "'":
-                # Проверяем, что между кавычками 16 hex символов
-                code = message[start+1:end]
-                if len(code) == 16:
-                    # Проверяем, что все символы hex (0-9, a-f, A-F)
-                    # Используем set для быстрой проверки
-                    if all(c in '0123456789abcdefABCDEF' for c in code):
-                        return True
-            # Ищем следующую кавычку
-            start = message.find("'", start + 1)
-
-    return False
-
-def extract_key_info_fast(message):
-    """
-    Быстрое извлечение информации из сообщения без регулярных выражений.
-    """
+def extract_key_info(message):
+    """Извлекает информацию из сообщения"""
     result = {
-        "code": None,
+        "code": extract_hex_code(message),
         "user": None,
         "room": None,
         "status": "UNKNOWN"
     }
-
-    # 1. Извлекаем код (16 hex символов в кавычках)
-    if "'" in message:
-        start = message.find("'")
-        while start != -1:
-            end = start + 17
-            if end < len(message) and message[end] == "'":
-                code = message[start+1:end]
-                if len(code) == 16:
-                    if all(c in '0123456789abcdefABCDEF' for c in code):
-                        result["code"] = code
-                        break
-            start = message.find("'", start + 1)
-
-    # 2. Извлекаем имя пользователя и комнату
-    #    Ищем "Mr. 'XXX  Room_YYY'"
+    
     mr_pos = message.find("Mr. '")
     if mr_pos != -1:
-        # Ищем закрывающую кавычку после Mr.
         end_quote = message.find("'", mr_pos + 5)
         if end_quote != -1:
-            # Извлекаем часть между кавычками
             content = message[mr_pos + 5:end_quote]
-            # Разделяем по пробелам
             parts = content.split()
-            if len(parts) >= 2:
-                # Ищем часть с "Room_"
-                for part in parts:
-                    if part.startswith("Room_"):
-                        result["room"] = part[5:]  # Убираем "Room_"
-                    elif part.isdigit() and not result["user"]:
-                        result["user"] = part
-
-    # 3. Определяем статус
+            for part in parts:
+                if part.startswith("Room_"):
+                    result["room"] = part[5:]
+                elif part.isdigit() and not result["user"]:
+                    result["user"] = part
+    
     if "ACCESS APPROVED" in message:
         result["status"] = "APPROVED"
     elif "ACCESS_DENIED" in message or "ACCESS DENIED" in message:
         result["status"] = "DENIED"
-
+    
     return result
 
-# Создаем сокет с оптимизированными параметрами
+def write_log(timestamp, device_name, info):
+    """Записывает лог в файл и выводит в консоль"""
+    log_line = f"{timestamp} | {device_name} | {info['user'] or '?'} | Room {info['room'] or '?'} | {info['status']} | {info['code']}\n"
+    
+    # Пишем в консоль
+    print(log_line.strip(), flush=True)
+    
+    # Пишем в файл
+    try:
+        with open(LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(log_line)
+            f.flush()  # Принудительно записываем на диск
+    except Exception as e:
+        print(f"Error writing to log file: {e}", flush=True)
+
+# Создаем директорию для логов если её нет
+try:
+    os.makedirs(os.path.dirname(LOG_FILE), exist_ok=True)
+except:
+    pass
+
+# Создаем сокет
 sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 8 * 1024 * 1024)  # Увеличиваем буфер
+sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 8 * 1024 * 1024)
 sock.bind((UDP_IP, UDP_PORT))
 sock.settimeout(1)
 
 print(f"UDP server listening on {UDP_IP}:{UDP_PORT}", flush=True)
 print(f"Sending to VictoriaLogs at {VICTORIA_URL}", flush=True)
-print("Optimized: fast filtering without regex", flush=True)
+print(f"Logging to {LOG_FILE}", flush=True)
 
-# Счетчики для мониторинга
-total_messages = 0
-filtered_messages = 0
+counter = 0
 
 while True:
     try:
         data, addr = sock.recvfrom(65535)
-        total_messages += 1
-
-        # Быстрое декодирование
+        
         try:
             message = data.decode('utf-8', errors='ignore').strip()
         except:
             continue
-
+            
         if not message:
             continue
 
-        # Быстрая фильтрация
-        if not is_relevant_log_fast(message):
+        if not is_relevant_log(message):
             continue
 
-        filtered_messages += 1
         source_ip = addr[0]
         device_name = DEVICE_NAMES.get(source_ip, source_ip)
+        info = extract_key_info(message)
 
-        # Быстрое извлечение информации
-        info = extract_key_info_fast(message)
-
-        # Логируем только если есть код
         if info["code"]:
-            print(f"[ACCESS] {device_name} | {info['user'] or '?'} @ Room {info['room'] or '?'} | {info['status']} | {info['code']}", flush=True)
+            counter += 1
+            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            
+            # Сохраняем лог в файл и выводим в консоль
+            write_log(timestamp, device_name, info)
 
-            # Минимальный payload для VictoriaLogs
+            # Отправляем в VictoriaLogs
             payload = {
                 "_msg": message,
                 "device": device_name,
@@ -203,7 +182,8 @@ while True:
                 "key_code": info["code"],
                 "user": info["user"] or "",
                 "room": info["room"] or "",
-                "access_status": info["status"]
+                "access_status": info["status"],
+                "timestamp": timestamp
             }
 
             try:
@@ -214,14 +194,9 @@ while True:
                     timeout=2
                 )
                 if resp.status_code != 204:
-                    print(f"HTTP error: {resp.status_code}", flush=True)
+                    print(f"HTTP error: {resp.status_code} for {info['code']}", flush=True)
             except Exception as e:
                 print(f"Request error: {e}", flush=True)
-
-        # Логируем статистику каждые 10000 сообщений
-        if total_messages % 10000 == 0:
-            print(f"Stats: {total_messages} total, {filtered_messages} filtered "
-                  f"({filtered_messages*100//total_messages if total_messages else 0}%)", flush=True)
 
     except socket.timeout:
         pass
