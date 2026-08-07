@@ -1,17 +1,12 @@
 import socket
 import requests
 import os
-from datetime import datetime
-import time
 
 UDP_IP = "0.0.0.0"
 UDP_PORT = 514
 
 # VictoriaLogs URL из переменной окружения
 VICTORIA_URL = os.environ.get("VICTORIA_URL", "http://victorialogs:9428")
-
-# Файл для сохранения всех логов (будет смонтирован наружу)
-LOG_FILE = "/logs/access.log"
 
 DEVICE_NAMES = {
     "10.204.7.7": "CONT 2.3.1",
@@ -67,8 +62,8 @@ def extract_hex_code(message):
             if len(code) == 16 and all(c in HEX_CHARS for c in code):
                 return code
         start = message.find("'", start + 1)
-    
-    # Ищем без кавычек
+
+    # Ищем без кавычек (любой 16-значный hex)
     i = 0
     while i < len(message) - 15:
         if message[i] in HEX_CHARS:
@@ -79,6 +74,7 @@ def extract_hex_code(message):
                 if before_ok and after_ok:
                     return code
         i += 1
+
     return None
 
 def is_relevant_log(message):
@@ -95,7 +91,8 @@ def extract_key_info(message):
         "room": None,
         "status": "UNKNOWN"
     }
-    
+
+    # Извлекаем имя и комнату
     mr_pos = message.find("Mr. '")
     if mr_pos != -1:
         end_quote = message.find("'", mr_pos + 5)
@@ -107,34 +104,14 @@ def extract_key_info(message):
                     result["room"] = part[5:]
                 elif part.isdigit() and not result["user"]:
                     result["user"] = part
-    
+
+    # Определяем статус
     if "ACCESS APPROVED" in message:
         result["status"] = "APPROVED"
     elif "ACCESS_DENIED" in message or "ACCESS DENIED" in message:
         result["status"] = "DENIED"
-    
+
     return result
-
-def write_log(timestamp, device_name, info):
-    """Записывает лог в файл и выводит в консоль"""
-    log_line = f"{timestamp} | {device_name} | {info['user'] or '?'} | Room {info['room'] or '?'} | {info['status']} | {info['code']}\n"
-    
-    # Пишем в консоль
-    print(log_line.strip(), flush=True)
-    
-    # Пишем в файл
-    try:
-        with open(LOG_FILE, "a", encoding="utf-8") as f:
-            f.write(log_line)
-            f.flush()  # Принудительно записываем на диск
-    except Exception as e:
-        print(f"Error writing to log file: {e}", flush=True)
-
-# Создаем директорию для логов если её нет
-try:
-    os.makedirs(os.path.dirname(LOG_FILE), exist_ok=True)
-except:
-    pass
 
 # Создаем сокет
 sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -144,22 +121,20 @@ sock.settimeout(1)
 
 print(f"UDP server listening on {UDP_IP}:{UDP_PORT}", flush=True)
 print(f"Sending to VictoriaLogs at {VICTORIA_URL}", flush=True)
-print(f"Logging to {LOG_FILE}", flush=True)
-
-counter = 0
 
 while True:
     try:
         data, addr = sock.recvfrom(65535)
-        
+
         try:
             message = data.decode('utf-8', errors='ignore').strip()
         except:
             continue
-            
+
         if not message:
             continue
 
+        # Фильтруем только сообщения с hex-кодом
         if not is_relevant_log(message):
             continue
 
@@ -168,13 +143,8 @@ while True:
         info = extract_key_info(message)
 
         if info["code"]:
-            counter += 1
-            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            
-            # Сохраняем лог в файл и выводим в консоль
-            write_log(timestamp, device_name, info)
+            print(f"[ACCESS] {device_name} | {info['user'] or '?'} @ Room {info['room'] or '?'} | {info['status']} | {info['code']}", flush=True)
 
-            # Отправляем в VictoriaLogs
             payload = {
                 "_msg": message,
                 "device": device_name,
@@ -182,8 +152,7 @@ while True:
                 "key_code": info["code"],
                 "user": info["user"] or "",
                 "room": info["room"] or "",
-                "access_status": info["status"],
-                "timestamp": timestamp
+                "access_status": info["status"]
             }
 
             try:
@@ -194,7 +163,7 @@ while True:
                     timeout=2
                 )
                 if resp.status_code != 204:
-                    print(f"HTTP error: {resp.status_code} for {info['code']}", flush=True)
+                    print(f"HTTP error: {resp.status_code}", flush=True)
             except Exception as e:
                 print(f"Request error: {e}", flush=True)
 
