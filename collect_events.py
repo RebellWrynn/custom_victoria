@@ -3,9 +3,6 @@
 Скрипт для сбора событий доступа в реальном времени.
 Запуск: python3 collect_events.py
 Остановка: Ctrl+C
-
-Все события записываются в файл access_events.log в формате:
-время | L3-адрес | CONT | ключ | статус | пользователь
 """
 
 import socket
@@ -69,6 +66,7 @@ def signal_handler(sig, frame):
 
 def extract_hex_code(message):
     """Извлекает 16-значный hex-код из сообщения."""
+    # Ищем в кавычках
     start = message.find("'")
     while start != -1:
         end = start + 17
@@ -78,6 +76,7 @@ def extract_hex_code(message):
                 return code
         start = message.find("'", start + 1)
 
+    # Ищем без кавычек
     i = 0
     while i < len(message) - 15:
         if message[i] in HEX_CHARS:
@@ -92,7 +91,16 @@ def extract_hex_code(message):
 
 
 def extract_l3_address(message):
-    """Извлекает L3 адрес (8 символов, начинается с 00)."""
+    """
+    Извлекает L3 адрес из сообщения.
+    Поддерживает разные форматы:
+    - JSON: "dstaddr": "00E00624"
+    - JSON: "srcaddr": "00E00624"
+    - Текстовый: reader 0x00e006ca
+    - Текстовый: dst=0x00e006ca
+    - Любой 8-значный hex начинающийся с 00
+    """
+    # 1. Ищем в JSON полях
     match = re.search(r'"dstaddr":\s*"([0-9A-Fa-f]{8})"', message, re.IGNORECASE)
     if match:
         return match.group(1).upper()
@@ -101,21 +109,39 @@ def extract_l3_address(message):
     if match:
         return match.group(1).upper()
     
-    match = re.search(r'(00[0-9A-Fa-f]{6})', message)
+    # 2. Ищем текстовые форматы
+    match = re.search(r'(?:reader|dst|src)\s+0x([0-9a-fA-F]{8})', message)
     if match:
         return match.group(1).upper()
+    
+    # 3. Ищем как отдельный L3 адрес (8 символов, начинается с 00)
+    # Но не берем 00000000 (это невалидный адрес)
+    match = re.search(r'(00[0-9A-Fa-f]{6})', message)
+    if match:
+        addr = match.group(1).upper()
+        if addr != "00000000":  # Игнорируем нулевой адрес
+            return addr
     
     return None
 
 
 def extract_user_id(message):
     """Извлекает ID пользователя."""
+    # Из auth_requested
     match = re.search(r'auth_requested.*username=([0-9]+)', message)
     if match:
         return match.group(1)
+    
+    # Из Mr. '...'
     match = re.search(r"Mr\. '([0-9]+)", message)
     if match:
         return match.group(1)
+    
+    # Из "asterisk"/008000...
+    match = re.search(r'"asterisk"/0*([0-9]{8,})', message)
+    if match:
+        return match.group(1)
+    
     return None
 
 
@@ -130,12 +156,27 @@ def extract_timestamp(message):
 
 def is_access_event(message):
     """Проверяет, является ли сообщение событием доступа."""
-    if "ACCESS APPROVED" in message or "ACCESS_DENIED" in message or "ACCESS DENIED" in message:
-        return True
-    if "ca_module_arm" in message and "access_decision" in message:
-        return True
-    if "net_module_arm" in message and "access_decision" in message:
-        return True
+    # Ключевые слова для событий доступа
+    access_keywords = [
+        "ACCESS APPROVED",
+        "ACCESS_DENIED", 
+        "ACCESS DENIED",
+        "access_decision",
+        "OPEN_DOOR_IND",
+        "OPEN_DOOR_REQ",
+        "REGISTRATION_SUCCEEDED_IND",
+        "REGISTRATION_FAILED_IND",
+    ]
+    
+    for keyword in access_keywords:
+        if keyword in message:
+            return True
+    
+    # Проверяем наличие hex-кода в сообщении от ca_module_arm или net_module_arm
+    if "ca_module_arm" in message or "net_module_arm" in message:
+        if extract_hex_code(message):
+            return True
+    
     return False
 
 
@@ -145,6 +186,10 @@ def get_access_status(message):
         return "APPROVED"
     elif "ACCESS_DENIED" in message or "ACCESS DENIED" in message:
         return "DENIED"
+    elif "REGISTRATION_SUCCEEDED_IND" in message:
+        return "REGISTERED"
+    elif "REGISTRATION_FAILED_IND" in message:
+        return "REG_FAILED"
     return "UNKNOWN"
 
 
@@ -153,7 +198,7 @@ def main():
     signal.signal(signal.SIGINT, signal_handler)
 
     print("=" * 80)
-    print("🔑 ACCESS EVENT COLLECTOR")
+    print("🔑 ACCESS EVENT COLLECTOR (FIXED)")
     print("=" * 80)
     print(f"📡 Listening on UDP {UDP_IP}:{UDP_PORT}")
     print(f"📁 Writing to: {LOG_FILE}")
@@ -161,19 +206,14 @@ def main():
     print("=" * 80)
     print()
 
-    # Проверяем, существует ли файл, и добавляем заголовок если новый
-    file_exists = os.path.exists(LOG_FILE)
-    
-    # Открываем файл для записи (в режиме append)
-    f = open(LOG_FILE, 'a', buffering=1)  # line buffering
-    
-    if not file_exists:
-        f.write("# " + "=" * 100 + "\n")
-        f.write("# ACCESS EVENTS LOG\n")
-        f.write(f"# Started: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
-        f.write("# " + "=" * 100 + "\n")
-        f.write("# TIME | L3_ADDRESS | CONT | KEY | STATUS | USER\n")
-        f.write("#" + "-" * 100 + "\n")
+    # Очищаем старый файл при запуске
+    f = open(LOG_FILE, 'w', buffering=1)
+    f.write("# " + "=" * 100 + "\n")
+    f.write("# ACCESS EVENTS LOG\n")
+    f.write(f"# Started: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+    f.write("# " + "=" * 100 + "\n")
+    f.write("# TIME | L3_ADDRESS | CONT | KEY | STATUS | USER\n")
+    f.write("#" + "-" * 100 + "\n")
 
     # Создаем сокет
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -209,14 +249,33 @@ def main():
             source_ip = addr[0]
             device_name = DEVICE_NAMES.get(source_ip, source_ip)
 
-            # Если нет кода или L3-адреса — пропускаем
-            if not code or not l3_addr:
+            # Если нет кода — пропускаем
+            if not code:
+                continue
+
+            # Если L3-адрес не найден или равен 00000000 — пробуем найти в сообщении
+            if not l3_addr or l3_addr == "00000000":
+                # Ищем любой 8-значный hex кроме 00000000
+                match = re.search(r'(00[0-9A-Fa-f]{6})', message)
+                if match:
+                    addr = match.group(1).upper()
+                    if addr != "00000000":
+                        l3_addr = addr
+                else:
+                    # Ищем 0x00e006... формат
+                    match = re.search(r'0x([0-9a-fA-F]{8})', message)
+                    if match:
+                        addr = match.group(1).upper()
+                        if addr.startswith("00") and addr != "00000000":
+                            l3_addr = addr
+
+            # Если L3-адрес все еще не найден или нулевой — пропускаем
+            if not l3_addr or l3_addr == "00000000":
                 continue
 
             event_count += 1
 
             # Формируем строку для записи
-            # TIME | L3_ADDRESS | CONT | KEY | STATUS | USER
             log_line = f"{timestamp} | {l3_addr} | {device_name} | {code} | {status} | {user_id or ''}\n"
             
             # Пишем в файл
@@ -224,7 +283,8 @@ def main():
             f.flush()
 
             # Выводим в консоль
-            print(f"[{event_count:4d}] {timestamp} | {l3_addr} | {device_name[:20]:<20} | {code[:8]}... | {status}", flush=True)
+            status_symbol = "✅" if status == "APPROVED" else "❌" if status == "DENIED" else "📌"
+            print(f"{status_symbol} [{event_count:4d}] {timestamp} | {l3_addr} | {device_name[:20]:<20} | {code[:8]}... | {status}", flush=True)
 
         except socket.timeout:
             pass
