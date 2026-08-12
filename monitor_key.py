@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
 """
-Скрипт для мониторинга ключа e596849b
-Показывает ТОЛЬКО реальные события доступа (APPROVED/DENIED)
-Запуск: python3 monitor_key_fixed.py
-Остановка: Ctrl+C
+Отладочный скрипт - показывает ВСЕ сообщения с ключом e596849b
+и анализирует их статус
+Запуск: python3 debug_key.py
 """
 
 import socket
@@ -11,20 +10,13 @@ import re
 import signal
 import sys
 from datetime import datetime
-from collections import defaultdict
 
 UDP_IP = "0.0.0.0"
 UDP_PORT = 514
 
-# ВАШ КЛЮЧ
-TARGET_KEY = "e596849b00000000"
-TARGET_KEY_SHORT = "e596849b"
+TARGET_KEY = "e596849b"
+TARGET_KEY_FULL = "e596849b00000000"
 
-# Файл для записи
-LOG_FILE = f"key_{TARGET_KEY_SHORT}_access_fixed.log"
-SUMMARY_FILE = f"key_{TARGET_KEY_SHORT}_summary_fixed.txt"
-
-# --- СОПОСТАВЛЕНИЕ IP УСТРОЙСТВ С ИМЕНАМИ ---
 DEVICE_NAMES = {
     "10.204.7.7": "CONT 2.3.1",
     "10.204.7.6": "CONT 2.3 Вх Гр Д",
@@ -60,230 +52,107 @@ DEVICE_NAMES = {
     "10.204.1.50": "CONT 1.1 Вх Гр Д",
     "10.204.1.45": "CONT 1.1 Калитка",
     "10.204.1.200": "eti-serv3",
-    "10.204.6.2": "CONT 2.1 Калитка",
-    "10.204.3.52": "CONT 1.2 Калитка",
-    "10.204.1.49": "CONT 1.1 Калитка",
 }
 
 
 def signal_handler(sig, frame):
-    print("\n\n" + "=" * 80)
-    print("📊 FINAL STATISTICS")
-    print("=" * 80)
-    print_summary()
-    print("\n👋 Stopping monitor...")
+    print("\n\n👋 Stopping debug...")
     sys.exit(0)
 
 
-def extract_hex_code(message):
-    """Извлекает 16-значный hex-код из сообщения."""
-    # Ищем в кавычках
-    start = message.find("'")
-    while start != -1:
-        end = start + 17
-        if end < len(message) and message[end] == "'":
-            code = message[start+1:end]
-            if len(code) == 16 and all(c in '0123456789abcdefABCDEF' for c in code):
-                return code.lower()
-        start = message.find("'", start + 1)
-
-    # Ищем без кавычек
-    matches = re.findall(r'[0-9A-Fa-f]{16}', message)
-    for code in matches:
-        if code.lower() == TARGET_KEY:
-            return code.lower()
+def analyze_message(message, source_ip):
+    """Анализирует сообщение и показывает все найденные данные"""
+    results = {}
     
-    # Ищем 8-значный
-    matches_8 = re.findall(r'[0-9A-Fa-f]{8}', message)
-    for code in matches_8:
-        if code.lower() == TARGET_KEY_SHORT:
-            return TARGET_KEY
+    # 1. Проверяем наличие ключа
+    results['has_key'] = TARGET_KEY in message or TARGET_KEY_FULL in message
     
-    return None
-
-
-def extract_l3_address(message):
-    """Извлекает L3 адрес из сообщения."""
-    match = re.search(r'"dstaddr":\s*"([0-9A-Fa-f]{8})"', message, re.IGNORECASE)
-    if match:
-        return match.group(1).upper()
-    
-    match = re.search(r'"srcaddr":\s*"([0-9A-Fa-f]{8})"', message, re.IGNORECASE)
-    if match:
-        return match.group(1).upper()
-    
-    match = re.search(r'(?:reader|dst|src)\s+0x([0-9a-fA-F]{8})', message)
-    if match:
-        return match.group(1).upper()
-    
-    match = re.search(r'(00[0-9A-Fa-f]{6})', message)
-    if match:
-        addr = match.group(1).upper()
-        if addr != "00000000":
-            return addr
-    
-    return None
-
-
-def extract_timestamp(message):
-    """Извлекает время из сообщения syslog."""
-    match = re.search(r'([A-Z][a-z]{2}\s+\d{1,2}\s+\d{2}:\d{2}:\d{2})', message)
-    if match:
-        return match.group(1)
-    return datetime.now().strftime("%b %d %H:%M:%S")
-
-
-def get_access_status(message):
-    """Определяет статус доступа - ТОЛЬКО реальные события."""
-    # Сначала проверяем реальные события доступа
+    # 2. Ищем статус
     if "ACCESS APPROVED" in message:
-        return "APPROVED"
+        results['status'] = "APPROVED"
     elif "ACCESS_DENIED" in message or "ACCESS DENIED" in message:
-        return "DENIED"
+        results['status'] = "DENIED"
+    elif "auth_requested" in message:
+        results['status'] = "AUTH_REQUEST"
+    elif "REGISTRATION_SUCCEEDED_IND" in message:
+        results['status'] = "REGISTERED"
+    elif "REGISTRATION_FAILED_IND" in message:
+        results['status'] = "REG_FAILED"
+    elif "OPEN_DOOR_IND" in message:
+        results['status'] = "OPEN_DOOR"
+    elif "OPEN_DOOR_REQ" in message:
+        results['status'] = "OPEN_DOOR_REQ"
+    elif "access_decision" in message:
+        results['status'] = "ACCESS_DECISION"
+    else:
+        results['status'] = "UNKNOWN"
     
-    # Проверяем, есть ли ключевые слова, указывающие на событие доступа
-    access_indicators = [
-        "OPEN_DOOR_IND",
-        "OPEN_DOOR_REQ",
-        "access_decision",
-        "REGISTRATION_SUCCEEDED_IND",
-        "REGISTRATION_FAILED_IND"
-    ]
+    # 3. Ищем L3 адрес
+    l3_match = re.search(r'"dstaddr":\s*"([0-9A-Fa-f]{8})"', message, re.IGNORECASE)
+    if l3_match:
+        results['l3'] = l3_match.group(1)
+    else:
+        l3_match = re.search(r'"srcaddr":\s*"([0-9A-Fa-f]{8})"', message, re.IGNORECASE)
+        if l3_match:
+            results['l3'] = l3_match.group(1)
+        else:
+            l3_match = re.search(r'(?:reader|dst|src)\s+0x([0-9a-fA-F]{8})', message)
+            if l3_match:
+                results['l3'] = l3_match.group(1)
+            else:
+                results['l3'] = None
     
-    for indicator in access_indicators:
-        if indicator in message:
-            # Если есть индикатор, но нет APPROVED/DENIED - проверяем дальше
-            if "AUTH_REQUEST" in message:
-                return "AUTH_REQUEST"
-            return "EVENT"
+    # 4. Ищем пользователя
+    user_match = re.search(r'username=([0-9]+)', message)
+    if user_match:
+        results['user'] = user_match.group(1)
+    else:
+        user_match = re.search(r"Mr\. '([0-9]+)", message)
+        if user_match:
+            results['user'] = user_match.group(1)
+        else:
+            results['user'] = None
     
-    return None  # Не событие доступа
-
-
-def is_real_access_event(message):
-    """Проверяет, является ли сообщение реальным событием доступа"""
-    # Сообщения с ACCESS APPROVED или ACCESS_DENIED - точно события
-    if "ACCESS APPROVED" in message or "ACCESS_DENIED" in message:
-        return True
+    # 5. Ищем номер двери
+    door_match = re.search(r'door=(\d+)', message)
+    results['door_num'] = door_match.group(1) if door_match else None
     
-    # Сообщения с ключевыми словами доступа
-    access_keywords = [
-        "OPEN_DOOR_IND",
-        "OPEN_DOOR_REQ", 
-        "access_decision",
-        "auth_requested"
-    ]
+    # 6. Ищем hex код
+    hex_match = re.search(r"'([0-9A-Fa-f]{16})'", message, re.IGNORECASE)
+    results['hex_code'] = hex_match.group(1) if hex_match else None
     
-    for keyword in access_keywords:
-        if keyword in message:
-            return True
+    # 7. Проверяем ключевые слова
+    keywords = ["ACCESS", "auth_requested", "reader", "dstaddr", "srcaddr", "OPEN_DOOR", "access_decision"]
+    results['keywords_found'] = [kw for kw in keywords if kw in message]
     
-    return False
-
-
-def get_door_from_message(message, source_ip):
-    """Определяет дверь из сообщения"""
-    device_name = DEVICE_NAMES.get(source_ip, source_ip)
+    # 8. Дверь по IP
+    results['device'] = DEVICE_NAMES.get(source_ip, source_ip)
     
-    # Пытаемся найти L3 адрес
-    l3_addr = extract_l3_address(message)
-    
-    if l3_addr:
-        # Ищем номер двери в сообщении
-        door_match = re.search(r'door=(\d+)', message)
-        if door_match:
-            door_num = door_match.group(1)
-            return f"{device_name} (door {door_num})"
-        return f"{device_name} (L3:{l3_addr})"
-    
-    return device_name
-
-
-def print_summary():
-    """Выводит сводку по всем дверям"""
-    if not doors_stats:
-        print("❌ No access events recorded yet.")
-        return
-    
-    print("\n" + "=" * 80)
-    print("🚪 DOORS ACCESSED BY YOUR KEY")
-    print("=" * 80)
-    print(f"Total events: {total_events}")
-    print(f"✅ Approved: {approved_count}")
-    print(f"❌ Denied: {denied_count}")
-    print("\n📋 Doors list:")
-    print("-" * 80)
-    
-    # Сортируем по количеству
-    sorted_doors = sorted(doors_stats.items(), key=lambda x: x[1]['total'], reverse=True)
-    
-    for i, (door, stats) in enumerate(sorted_doors, 1):
-        status_icon = "🟢" if stats['approved'] > 0 else "🔴" if stats['denied'] > 0 else "⚪"
-        print(f"{i:2}. {status_icon} {door}")
-        print(f"    Total: {stats['total']} | ✅ {stats['approved']} | ❌ {stats['denied']}")
-        if stats['last_time']:
-            print(f"    Last: {stats['last_time']}")
-        if stats['users']:
-            print(f"    Users: {', '.join(stats['users'])}")
-        print()
-    
-    # Сохраняем в файл
-    with open(SUMMARY_FILE, 'w') as f:
-        f.write("=" * 80 + "\n")
-        f.write(f"SUMMARY FOR KEY: {TARGET_KEY_SHORT}\n")
-        f.write(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
-        f.write("=" * 80 + "\n\n")
-        f.write(f"Total events: {total_events}\n")
-        f.write(f"✅ Approved: {approved_count}\n")
-        f.write(f"❌ Denied: {denied_count}\n\n")
-        f.write("Doors:\n")
-        for door, stats in sorted_doors:
-            f.write(f"  {door}: {stats['total']} times (✅{stats['approved']} ❌{stats['denied']})\n")
-            if stats['users']:
-                f.write(f"    Users: {', '.join(stats['users'])}\n")
-
-
-# Глобальные переменные для статистики
-doors_stats = defaultdict(lambda: {'total': 0, 'approved': 0, 'denied': 0, 'last_time': None, 'users': set()})
-total_events = 0
-approved_count = 0
-denied_count = 0
+    return results
 
 
 def main():
-    global total_events, approved_count, denied_count
-    
     signal.signal(signal.SIGINT, signal_handler)
     
     print("=" * 80)
-    print("🔑 KEY MONITOR (FIXED - REAL ACCESS EVENTS ONLY)")
+    print("🔍 DEBUG - ALL MESSAGES WITH YOUR KEY")
     print("=" * 80)
-    print(f"🎯 Monitoring key: {TARGET_KEY_SHORT}")
+    print(f"🎯 Looking for key: {TARGET_KEY}")
     print(f"📡 Listening on UDP {UDP_IP}:{UDP_PORT}")
-    print(f"📁 Events log: {LOG_FILE}")
-    print(f"📊 Summary: {SUMMARY_FILE}")
     print("⏹️  Press Ctrl+C to stop")
     print("=" * 80)
-    print("\n🔄 Waiting for your key...")
-    print("💡 Only real ACCESS APPROVED/DENIED events will be shown\n")
+    print("\n🔄 Waiting for messages with your key...")
+    print("💡 Now go and use your key on different doors!\n")
 
-    # Открываем файл для записи событий
-    f = open(LOG_FILE, 'w', buffering=1)
-    f.write("#" + "=" * 100 + "\n")
-    f.write(f"# KEY MONITOR: {TARGET_KEY_SHORT}\n")
-    f.write(f"# Started: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
-    f.write("#" + "=" * 100 + "\n")
-    f.write("# TIME | DOOR | L3_ADDRESS | STATUS | USER\n")
-    f.write("#" + "-" * 100 + "\n")
-
-    # Создаем сокет
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 8 * 1024 * 1024)
     sock.bind((UDP_IP, UDP_PORT))
     sock.settimeout(1)
 
-    debug_count = 0  # Для отладки
-    
+    found_count = 0
+    status_counts = {}
+    doors = {}
+
     while True:
         try:
             data, addr = sock.recvfrom(65535)
@@ -296,72 +165,86 @@ def main():
             if not message:
                 continue
             
-            # Проверяем наличие нашего ключа
-            hex_code = extract_hex_code(message)
-            if not hex_code:
-                continue
-            
-            # Проверяем, является ли это реальным событием доступа
-            if not is_real_access_event(message):
-                continue
-            
-            # Извлекаем данные
-            status = get_access_status(message)
-            
-            # Пропускаем, если не APPROVED и не DENIED
-            if status not in ["APPROVED", "DENIED"]:
-                continue
-            
-            timestamp = extract_timestamp(message)
             source_ip = addr[0]
+            timestamp = datetime.now().strftime("%H:%M:%S")
             
-            # Определяем дверь
-            door_name = get_door_from_message(message, source_ip)
+            # Пропускаем, если нет ключа
+            if TARGET_KEY not in message and TARGET_KEY_FULL not in message:
+                continue
             
-            # Извлекаем пользователя
-            user_match = re.search(r'username=([0-9]+)', message)
-            user = user_match.group(1) if user_match else None
+            found_count += 1
             
-            total_events += 1
+            # Анализируем сообщение
+            analysis = analyze_message(message, source_ip)
             
-            # Обновляем статистику
-            doors_stats[door_name]['total'] += 1
-            doors_stats[door_name]['last_time'] = timestamp
-            if user:
-                doors_stats[door_name]['users'].add(user)
+            # Статистика
+            status = analysis['status']
+            status_counts[status] = status_counts.get(status, 0) + 1
             
+            device = analysis['device']
+            doors[device] = doors.get(device, 0) + 1
+            
+            # Выводим результат
+            print("=" * 80)
+            print(f"🔔 [#{found_count}] {timestamp} | From: {source_ip}")
+            print(f"📱 Device: {device}")
+            print(f"📊 Status: {analysis['status']}")
+            
+            if analysis['l3']:
+                print(f"🔢 L3 Address: {analysis['l3']}")
+            
+            if analysis['user']:
+                print(f"👤 User: {analysis['user']}")
+            
+            if analysis['door_num']:
+                print(f"🚪 Door number: {analysis['door_num']}")
+            
+            if analysis['hex_code']:
+                print(f"🔑 Hex code: {analysis['hex_code']}")
+            
+            if analysis['keywords_found']:
+                print(f"🏷️  Keywords: {', '.join(analysis['keywords_found'])}")
+            
+            # Показываем первые 300 символов сообщения
+            print(f"\n📨 Message preview:")
+            print(f"   {message[:300]}...")
+            
+            # Если статус APPROVED - выделяем
             if status == "APPROVED":
-                approved_count += 1
-                doors_stats[door_name]['approved'] += 1
-                status_icon = "✅"
-                status_text = "APPROVED"
-                print(f"\n🟢 ✅ ACCESS GRANTED!")
-            else:
-                denied_count += 1
-                doors_stats[door_name]['denied'] += 1
-                status_icon = "❌"
-                status_text = "DENIED"
-                print(f"\n🔴 ❌ ACCESS DENIED!")
+                print("   🟢 ✅ ACCESS APPROVED!")
+            elif status == "DENIED":
+                print("   🔴 ❌ ACCESS DENIED!")
             
-            # Выводим в консоль
-            print(f"{status_icon} [{total_events:3d}] {timestamp}")
-            print(f"   🚪 Door: {door_name}")
-            print(f"   📍 IP: {source_ip}")
-            if user:
-                print(f"   👤 User: {user}")
+            print("=" * 80)
             print()
             
-            # Записываем в файл
-            log_line = f"{timestamp} | {door_name} | {source_ip} | {status} | {user or ''}\n"
-            f.write(log_line)
-            f.flush()
+            # Сохраняем полное сообщение в файл
+            with open(f"debug_key_{TARGET_KEY}.log", 'a') as f:
+                f.write("=" * 80 + "\n")
+                f.write(f"#{found_count} {timestamp} From: {source_ip}\n")
+                f.write(f"Status: {status}\n")
+                f.write(f"Device: {device}\n")
+                if analysis['l3']:
+                    f.write(f"L3: {analysis['l3']}\n")
+                f.write(f"Full message:\n{message}\n")
+                f.write("=" * 80 + "\n\n")
+            
+            # Каждые 5 сообщений показываем статистику
+            if found_count % 5 == 0:
+                print("\n📊 QUICK STATS:")
+                print(f"   Total found: {found_count}")
+                print(f"   Statuses:")
+                for s, count in status_counts.items():
+                    print(f"     {s}: {count}")
+                print(f"   Doors:")
+                for d, count in list(doors.items())[-5:]:  # Показываем последние 5
+                    print(f"     {d}: {count}")
+                print()
             
         except socket.timeout:
             pass
         except Exception as e:
             print(f"Error: {e}", flush=True)
-    
-    f.close()
 
 
 if __name__ == "__main__":
