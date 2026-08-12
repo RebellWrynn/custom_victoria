@@ -17,6 +17,7 @@ UDP_PORT = 514
 
 # Файл для записи событий
 LOG_FILE = "access_events.log"
+DEBUG_FILE = "debug_messages.log"  # Для отладки
 
 # --- СОПОСТАВЛЕНИЕ IP УСТРОЙСТВ С ИМЕНАМИ ---
 DEVICE_NAMES = {
@@ -104,16 +105,16 @@ def extract_l3_address(message):
     match = re.search(r'"dstaddr":\s*"([0-9A-Fa-f]{8})"', message, re.IGNORECASE)
     if match:
         return match.group(1).upper()
-    
+
     match = re.search(r'"srcaddr":\s*"([0-9A-Fa-f]{8})"', message, re.IGNORECASE)
     if match:
         return match.group(1).upper()
-    
+
     # 2. Ищем текстовые форматы
     match = re.search(r'(?:reader|dst|src)\s+0x([0-9a-fA-F]{8})', message)
     if match:
         return match.group(1).upper()
-    
+
     # 3. Ищем как отдельный L3 адрес (8 символов, начинается с 00)
     # Но не берем 00000000 (это невалидный адрес)
     match = re.search(r'(00[0-9A-Fa-f]{6})', message)
@@ -121,7 +122,7 @@ def extract_l3_address(message):
         addr = match.group(1).upper()
         if addr != "00000000":  # Игнорируем нулевой адрес
             return addr
-    
+
     return None
 
 
@@ -131,17 +132,17 @@ def extract_user_id(message):
     match = re.search(r'auth_requested.*username=([0-9]+)', message)
     if match:
         return match.group(1)
-    
+
     # Из Mr. '...'
     match = re.search(r"Mr\. '([0-9]+)", message)
     if match:
         return match.group(1)
-    
+
     # Из "asterisk"/008000...
     match = re.search(r'"asterisk"/0*([0-9]{8,})', message)
     if match:
         return match.group(1)
-    
+
     return None
 
 
@@ -159,24 +160,36 @@ def is_access_event(message):
     # Ключевые слова для событий доступа
     access_keywords = [
         "ACCESS APPROVED",
-        "ACCESS_DENIED", 
+        "ACCESS_DENIED",
         "ACCESS DENIED",
         "access_decision",
         "OPEN_DOOR_IND",
         "OPEN_DOOR_REQ",
         "REGISTRATION_SUCCEEDED_IND",
         "REGISTRATION_FAILED_IND",
+        "reader",  # Добавляем ключевые слова из сообщений
+        "dstaddr",
+        "srcaddr",
+        "auth_requested",
+        "Mr.",
+        "asterisk",
+        "ca_module_arm",
+        "net_module_arm",
     ]
-    
-    for keyword in access_keywords:
-        if keyword in message:
-            return True
-    
-    # Проверяем наличие hex-кода в сообщении от ca_module_arm или net_module_arm
+
+    # Проверяем наличие hex-кода, если это сообщение от модулей
     if "ca_module_arm" in message or "net_module_arm" in message:
         if extract_hex_code(message):
             return True
-    
+
+    for keyword in access_keywords:
+        if keyword in message:
+            return True
+
+    # Если есть L3 адрес - тоже считаем событием доступа
+    if extract_l3_address(message):
+        return True
+
     return False
 
 
@@ -190,6 +203,10 @@ def get_access_status(message):
         return "REGISTERED"
     elif "REGISTRATION_FAILED_IND" in message:
         return "REG_FAILED"
+    elif "auth_requested" in message:
+        return "AUTH_REQUEST"
+    elif "reader" in message and "0x" in message:
+        return "READER_EVENT"
     return "UNKNOWN"
 
 
@@ -198,15 +215,16 @@ def main():
     signal.signal(signal.SIGINT, signal_handler)
 
     print("=" * 80)
-    print("🔑 ACCESS EVENT COLLECTOR (FIXED)")
+    print("🔑 ACCESS EVENT COLLECTOR (DEBUG MODE)")
     print("=" * 80)
     print(f"📡 Listening on UDP {UDP_IP}:{UDP_PORT}")
     print(f"📁 Writing to: {LOG_FILE}")
+    print(f"🐛 Debug log: {DEBUG_FILE}")
     print("⏹️  Press Ctrl+C to stop")
     print("=" * 80)
     print()
 
-    # Очищаем старый файл при запуске
+    # Очищаем старые файлы при запуске
     f = open(LOG_FILE, 'w', buffering=1)
     f.write("# " + "=" * 100 + "\n")
     f.write("# ACCESS EVENTS LOG\n")
@@ -215,6 +233,11 @@ def main():
     f.write("# TIME | L3_ADDRESS | CONT | KEY | STATUS | USER\n")
     f.write("#" + "-" * 100 + "\n")
 
+    debug_f = open(DEBUG_FILE, 'w', buffering=1)
+    debug_f.write("# DEBUG LOG - ALL MESSAGES\n")
+    debug_f.write(f"# Started: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+    debug_f.write("#" + "-" * 100 + "\n")
+
     # Создаем сокет
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 8 * 1024 * 1024)
@@ -222,6 +245,7 @@ def main():
     sock.settimeout(1)
 
     event_count = 0
+    total_messages = 0
 
     while True:
         try:
@@ -235,8 +259,23 @@ def main():
             if not message:
                 continue
 
+            total_messages += 1
+            source_ip = addr[0]
+
+            # Логируем все сообщения для отладки (только первые 200 символов)
+            if total_messages <= 100:  # Ограничиваем размер debug файла
+                debug_f.write(f"[{total_messages:4d}] {source_ip}: {message[:200]}\n")
+                debug_f.flush()
+
+            # Проверяем, есть ли hex-код в сообщении
+            has_hex = bool(extract_hex_code(message))
+            has_l3 = bool(extract_l3_address(message))
+            
             # Фильтруем только события доступа
             if not is_access_event(message):
+                # Если есть hex код или L3 адрес, но не прошло фильтр - показываем предупреждение
+                if has_hex or has_l3:
+                    print(f"⚠️  Skipped message with hex/L3: {message[:100]}...", flush=True)
                 continue
 
             # Извлекаем данные
@@ -245,13 +284,24 @@ def main():
             user_id = extract_user_id(message)
             status = get_access_status(message)
             timestamp = extract_timestamp(message)
-            
-            source_ip = addr[0]
+
             device_name = DEVICE_NAMES.get(source_ip, source_ip)
 
-            # Если нет кода — пропускаем
+            # Если нет кода - пробуем другие варианты
             if not code:
-                continue
+                # Ищем любой hex код в сообщении (для отладки)
+                hex_matches = re.findall(r'[0-9A-Fa-f]{16}', message)
+                if hex_matches:
+                    code = hex_matches[0]
+                    print(f"🔍 Found hex code without quotes: {code}", flush=True)
+                else:
+                    # Если нет кода, но есть L3 - используем L3 как идентификатор
+                    if l3_addr:
+                        code = l3_addr + "00000000"  # Создаем фиктивный код для отладки
+                        print(f"🔍 Using L3 as ID: {code}", flush=True)
+                    else:
+                        # Если нет кода и нет L3 - пропускаем
+                        continue
 
             # Если L3-адрес не найден или равен 00000000 — пробуем найти в сообщении
             if not l3_addr or l3_addr == "00000000":
@@ -269,15 +319,16 @@ def main():
                         if addr.startswith("00") and addr != "00000000":
                             l3_addr = addr
 
-            # Если L3-адрес все еще не найден или нулевой — пропускаем
+            # Если все еще нет L3 - используем IP как идентификатор
             if not l3_addr or l3_addr == "00000000":
-                continue
+                l3_addr = source_ip.replace('.', '')[:8]  # Используем IP как ID
+                print(f"🔍 Using IP as L3: {l3_addr} (from {source_ip})", flush=True)
 
             event_count += 1
 
             # Формируем строку для записи
             log_line = f"{timestamp} | {l3_addr} | {device_name} | {code} | {status} | {user_id or ''}\n"
-            
+
             # Пишем в файл
             f.write(log_line)
             f.flush()
@@ -292,6 +343,7 @@ def main():
             print(f"Error: {e}", flush=True)
 
     f.close()
+    debug_f.close()
 
 
 if __name__ == "__main__":
